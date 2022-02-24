@@ -1,4 +1,3 @@
-use linkdrop::LINKDROP_DEPOSIT;
 use near_contract_standards::{
     event::NftMintData,
     non_fungible_token::{
@@ -16,6 +15,12 @@ use near_sdk::{
     PromiseOrValue, PublicKey,
 };
 use near_units::{parse_gas, parse_near};
+use serde::{Deserialize, Serialize};
+
+use linkdrop::LINKDROP_DEPOSIT;
+use payout::*;
+use raffle::Raffle;
+use util::{is_promise_success, refund};
 
 #[cfg(feature = "airdrop")]
 mod airdrop;
@@ -26,12 +31,7 @@ mod raffle;
 mod raffle_collection;
 mod util;
 
-use payout::*;
-use raffle::Raffle;
-use serde::{Deserialize, Serialize};
-use util::{is_promise_success, refund};
-
-#[near_bindgen]
+#[near_bindgen] // allow the compilation into WebAssembly to be compatible with the NEAR blockchain
 #[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
 pub struct Contract {
     pub(crate) tokens: NonFungibleToken,
@@ -184,7 +184,7 @@ impl Contract {
     #[init]
     pub fn new_default_meta(
         owner_id: AccountId,
-        metadata: InitialMetadata,
+        metadata: InitialMetadata, // two nft for same account prefer different account
         size: u32,
         price_structure: PriceStructure,
         sale: Option<Sale>,
@@ -236,7 +236,13 @@ impl Contract {
     }
 
     pub fn add_whitelist_accounts(&mut self, accounts: Vec<AccountId>, allowance: Option<u32>) {
-        self.assert_owner();
+        // self.assert_owner();
+        let owner_id = &env::signer_account_id();
+        if !self.is_owner(owner_id) {
+            println!("not owner");
+        } else {
+            println!("owner");
+        }
         require!(
             accounts.len() <= 10,
             "Can't add more than ten accounts at a time"
@@ -284,7 +290,7 @@ impl Contract {
         &mut self,
         _token_id: TokenId,
         _token_owner_id: AccountId,
-        _token_metadata: TokenMetadata,
+        _token_metadata: TokenMetadata, // 5555 metadata    change the create the metadata
     ) -> Token {
         self.nft_mint_one()
     }
@@ -308,7 +314,7 @@ impl Contract {
             ))
     }
 
-    // #[payable]
+    /*// #[payable]
     // pub fn create_linkdrops(&mut self, public_keys: Vec<PublicKey>) -> Promise {
     //     let num_of_links = public_keys.len() as u32;
     //     require!(num_of_links > 0, format!("Must include at least one public key, got {:#?}", public_keys));
@@ -328,12 +334,21 @@ impl Contract {
     //         ))
     //     }
     //     promises
-    // }
+    // }*/
 
     #[payable]
     pub fn nft_mint_one(&mut self) -> Token {
         self.nft_mint_many(1)[0].clone()
     }
+
+    /*#[payable]
+    pub fn nft_mint_many(&mut self, num: u32) -> Vec<Token> {
+        let owner_id = &env::signer_account_id(); // ask: it's a default name which is "bob.near", I think that I need to put the owner id from the contract.
+        let num = self.assert_can_mint(owner_id, num); // anyone
+        let tokens = self.nft_mint_many_ungaurded(num, owner_id, false);
+        self.use_whitelist_allowance(owner_id, num);
+        tokens
+    }*/
 
     #[payable]
     pub fn nft_mint_many(&mut self, num: u32) -> Vec<Token> {
@@ -353,8 +368,9 @@ impl Contract {
         let initial_storage_usage = if mint_for_free {
             0
         } else {
-            env::storage_usage()
+            env::storage_usage() // is 307650 byte in while my debugging
         };
+        println!("init storage usage = {}", initial_storage_usage);
 
         // Mint tokens
         let tokens: Vec<Token> = (0..num)
@@ -363,10 +379,14 @@ impl Contract {
 
         if !mint_for_free {
             let storage_used = env::storage_usage() - initial_storage_usage;
+            println!("storage_used: {}", storage_used);
             if let Some(royalties) = self.initial_royalties.get() {
+                println!("I am inside if!");
                 // Keep enough funds to cover storage and split the rest as royalties
                 let storage_cost = env::storage_byte_cost() * storage_used as Balance;
+                println!("storage_cost: {}", storage_cost);
                 let left_over_funds = env::attached_deposit() - storage_cost;
+                println!("left_over_funds: {}", left_over_funds);
                 royalties.send_funds(left_over_funds, &self.tokens.owner_id);
             } else {
                 // Keep enough funds to cover storage and send rest to contract owner
@@ -375,6 +395,7 @@ impl Contract {
         }
         // Emit mint event log
         log_mint(owner_id, &tokens);
+
         tokens
     }
 
@@ -383,16 +404,20 @@ impl Contract {
     }
 
     pub fn total_cost(&self, num: u32, minter: &AccountId) -> U128 {
-        (num as Balance * self.cost_per_token(num, minter).0).into()
+        let cost_per_token = self.cost_per_token(num, minter).0;
+        (num as Balance * cost_per_token).into()
     }
 
     pub fn cost_per_token(&self, num: u32, minter: &AccountId) -> U128 {
         let base_cost = if self.is_owner(minter) {
+            println!("I am the owner!!");
             0
         } else {
+            println!("I am not the owner!!");
             (self.base_cost - self.discount(num).0).max(self.min_cost)
         };
-        (base_cost + self.token_storage_cost().0).into()
+        let res = (base_cost + self.token_storage_cost().0).into();
+        res
     }
 
     pub fn token_storage_cost(&self) -> U128 {
@@ -464,6 +489,9 @@ impl Contract {
 
     // Private methods
     fn assert_deposit(&self, num: u32, account_id: &AccountId) {
+        println!("{}", env::attached_deposit());
+        println!("{}", self.total_cost(num, account_id).0);
+        println!();
         require!(
             env::attached_deposit() >= self.total_cost(num, account_id).0,
             "Not enough attached deposit to buy"
@@ -479,7 +507,7 @@ impl Contract {
                 self.get_whitelist_allowance(account_id)
             } else {
                 require!(self.is_premint_over, "Premint period must be over");
-                self.get_or_add_whitelist_allowance(account_id, num)
+                self.get_or_add_whitelist_allowance(account_id, num) // revise: this account returns 1 but need to return 10 according to the testcase
             };
             num = u32::min(allowance, num);
             require!(num > 0, "Account has no more allowance left");
@@ -494,7 +522,10 @@ impl Contract {
     }
 
     fn signer_is_owner(&self) -> bool {
-        self.is_owner(&env::signer_account_id())
+        // ask: is a static acount_id (bob.near)
+        let res = self.is_owner(&env::signer_account_id());
+        println!("{}", res);
+        res
     }
 
     fn is_owner(&self, minter: &AccountId) -> bool {
@@ -512,6 +543,7 @@ impl Contract {
 
     fn draw_and_mint(&mut self, token_owner_id: AccountId, refund: Option<AccountId>) -> Token {
         let id = self.raffle.draw();
+        println!("id: {}", id);
         self.internal_mint(id.to_string(), token_owner_id, refund)
     }
 
@@ -581,6 +613,7 @@ near_contract_standards::impl_non_fungible_token_enumeration!(Contract, tokens);
 fn log_mint(owner_id: &AccountId, tokens: &[Token]) {
     let token_ids = tokens.iter().map(|t| t.token_id.as_str()).collect();
     NearEvent::nft_mint(vec![NftMintData::new(owner_id, token_ids, None)]).emit();
+    println!("Done Emitting the nft to the owner id.");
 }
 const fn to_near(num: u32) -> Balance {
     (num as Balance * 10u128.pow(24)) as Balance
@@ -588,15 +621,30 @@ const fn to_near(num: u32) -> Balance {
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(test)]
 mod tests {
+    use near_sdk::json_types::ValidAccountId;
+    use near_sdk::test_utils::VMContextBuilder;
+    use near_sdk::testing_env;
+
     use super::*;
+
     const TEN: u128 = to_near(10);
     const ONE: u128 = to_near(1);
 
+    fn get_context(predecessor_account_id: ValidAccountId) -> VMContextBuilder {
+        let mut context_builder = VMContextBuilder::new();
+        context_builder
+            .current_account_id(account())
+            .signer_account_id(predecessor_account_id.clone())
+            .predecessor_account_id(predecessor_account_id);
+        context_builder
+    }
+
     fn account() -> AccountId {
-        AccountId::new_unchecked("alice.near".to_string())
+        AccountId::new_unchecked("bob.near".to_string())
     }
 
     fn initial_metadata() -> InitialMetadata {
+        // ask: is the metadata is located in a specific site.
         InitialMetadata {
             name: "name".to_string(),
             symbol: "sym".to_string(),
@@ -607,7 +655,21 @@ mod tests {
 
     fn new_contract() -> Contract {
         Contract::new_default_meta(
-            AccountId::new_unchecked("root".to_string()),
+            AccountId::new_unchecked("bob.near".to_string()),
+            initial_metadata(),
+            10_000,
+            PriceStructure {
+                base_cost: TEN.into(),
+                min_cost: Some(ONE.into()),
+                percent_off: None,
+            },
+            None,
+        )
+    }
+
+    fn new_contract2() -> Contract {
+        Contract::new_default_meta(
+            AccountId::new_unchecked("abdelaziz.testnet".to_string()),
             initial_metadata(),
             10_000,
             PriceStructure {
@@ -623,8 +685,8 @@ mod tests {
     fn check_price() {
         let contract = new_contract();
         assert_eq!(
-            contract.cost_per_token(1, &account()).0,
-            TEN + contract.token_storage_cost().0
+            contract.cost_per_token(1, &account()).0, // 15230000000000000000000 for the admin (bob.near)
+            TEN + contract.token_storage_cost().0 // and 10015230000000000000000000 for any other owner.
         );
         assert_eq!(
             contract.cost_per_token(2, &account()).0,
@@ -636,6 +698,7 @@ mod tests {
             contract.discount(2).0,
             contract.discount(10).0,
         );
+        println!("{}", contract.base_cost);
         println!(
             "{}",
             (contract.base_cost - contract.discount(10).0).max(contract.min_cost)
@@ -645,5 +708,52 @@ mod tests {
             contract.cost_per_token(24, &account()).0,
             contract.cost_per_token(10, &account()).0
         );
+    }
+
+    #[test]
+    fn test_mint_nft_admin() {
+        let num = 10;
+        let prepaid_gas = Gas::ONE_TERA * 300;
+
+        let mut context = get_context(account());
+
+        let mut contract = new_contract();
+        let mint_storage_cost: u128 = contract.total_cost(num, &contract.tokens.owner_id).0;
+        println!("mint_storage_cost: {}", mint_storage_cost);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage()) // 307200 bytes
+            .attached_deposit(mint_storage_cost)
+            .predecessor_account_id(account()) // bob.near  (account_id = owner_id)
+            .prepaid_gas(prepaid_gas)
+            .build());
+
+        let tokens = contract.nft_mint_many(num as u32);
+        println!("{:#?}", tokens);
+    }
+
+    #[test]
+    fn test_mint_nft_normal() {
+        let num = 10;
+
+        let mut context = get_context(account());
+
+        let mut contract = new_contract2();
+        let accounts = vec![AccountId::new_unchecked(
+            contract.tokens.owner_id.to_string(),
+        )];
+
+        contract.add_whitelist_accounts(accounts, Some(10));
+        contract.is_premint_over = true;
+        let mint_storage_cost: u128 = contract.total_cost(num, &env::signer_account_id()).0; // 152300000
+        println!("mint_storage_cost: {}", mint_storage_cost);
+
+        testing_env!(context
+            .storage_usage(env::storage_usage()) // 307200 bytes
+            .attached_deposit(mint_storage_cost)
+            .build());
+
+        let tokens = contract.nft_mint_many(num);
+        println!("{:#?}", tokens);
     }
 }
